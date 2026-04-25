@@ -2,26 +2,25 @@
 //  REFLEX BALL — Vercel Serverless Function
 //  File: api/admin.js
 //  URL:  /api/admin
-//  Handles: Admin Auth · Cloudinary Upload Signatures
+//  Handles: Cloudinary Upload Signatures
+//  Auth: Supabase JWT verification
 // ═══════════════════════════════════════════════════
 
 const crypto = require('crypto');
 
 const {
-  ADMIN_USERNAME,
-  ADMIN_PASSWORD,
+  SUPABASE_URL,
+  SUPABASE_JWT_SECRET,   // Get from Supabase: Project Settings → API → JWT Secret
   CLOUDINARY_CLOUD_NAME,
   CLOUDINARY_API_KEY,
   CLOUDINARY_API_SECRET,
-  SESSION_SECRET,
 } = process.env;
 
-// ── Vercel uses module.exports = async (req, res) ──
 module.exports = async (req, res) => {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
@@ -29,31 +28,20 @@ module.exports = async (req, res) => {
   const body = req.body || {};
   const { action } = body;
 
+  // ── AUTH: verify Supabase JWT from Authorization header ──
+  // Admin panel sends: Authorization: Bearer <supabase_access_token>
+  const authHeader = req.headers.authorization || '';
+  const supabaseToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+
   switch (action) {
 
-    // ── LOGIN ──────────────────────────────────────
-    case 'login': {
-      const { username, password } = body;
-      const validUser = safeCompare(username || '', ADMIN_USERNAME || '');
-      const validPass = safeCompare(password || '', ADMIN_PASSWORD || '');
-      if (!validUser || !validPass) return res.status(401).json({ error: 'Invalid credentials' });
-
-      const expires = Date.now() + 8 * 60 * 60 * 1000;
-      const payload = `${expires}`;
-      const sig = hmac(payload, SESSION_SECRET || 'fallback-change-me');
-      const token = `${payload}.${sig}`;
-      return res.status(200).json({ token, expires });
-    }
-
-    // ── VERIFY ─────────────────────────────────────
-    case 'verify': {
-      if (!validateToken(body.token)) return res.status(401).json({ error: 'Invalid or expired token' });
-      return res.status(200).json({ valid: true });
-    }
-
-    // ── CLOUDINARY SIGN ────────────────────────────
+    // ── CLOUDINARY SIGN — requires valid Supabase JWT ──
     case 'cloudinary-sign': {
-      if (!validateToken(body.token)) return res.status(401).json({ error: 'Unauthorized' });
+      if (!supabaseToken) return res.status(401).json({ error: 'Unauthorized — no token' });
+
+      // Verify the Supabase JWT
+      const valid = await verifySupabaseJWT(supabaseToken);
+      if (!valid) return res.status(401).json({ error: 'Invalid or expired session' });
 
       const folder = body.folder || 'products';
       const timestamp = Math.round(Date.now() / 1000);
@@ -66,7 +54,8 @@ module.exports = async (req, res) => {
         .digest('hex');
 
       return res.status(200).json({
-        signature, timestamp,
+        signature,
+        timestamp,
         api_key: CLOUDINARY_API_KEY,
         cloud_name: CLOUDINARY_CLOUD_NAME,
         folder,
@@ -79,24 +68,60 @@ module.exports = async (req, res) => {
   }
 };
 
-function hmac(data, secret) {
-  return crypto.createHmac('sha256', secret).update(data).digest('hex');
+// ── Verify Supabase JWT ──
+// Supabase tokens are HS256 JWTs signed with the JWT secret from your project settings
+async function verifySupabaseJWT(token) {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return false;
+
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString());
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
+
+    // Check expiry
+    if (!payload.exp || Date.now() / 1000 > payload.exp) return false;
+
+    // Verify signature with SUPABASE_JWT_SECRET
+    if (!SUPABASE_JWT_SECRET) {
+      // If secret not configured, fall back to introspecting via Supabase API
+      return await verifyViaSupabaseAPI(token);
+    }
+
+    const signingInput = parts[0] + '.' + parts[1];
+    const expectedSig = crypto
+      .createHmac('sha256', SUPABASE_JWT_SECRET)
+      .update(signingInput)
+      .digest('base64url');
+
+    return safeCompare(parts[2], expectedSig);
+  } catch (e) {
+    console.error('JWT verify error:', e);
+    return false;
+  }
 }
 
-function validateToken(token) {
-  if (!token || typeof token !== 'string') return false;
-  const parts = token.split('.');
-  if (parts.length !== 2) return false;
-  const [expires, sig] = parts;
-  if (Date.now() > parseInt(expires, 10)) return false;
-  const expected = hmac(expires, SESSION_SECRET || 'fallback-change-me');
-  return safeCompare(sig, expected);
+// Fallback: call Supabase /auth/v1/user endpoint to validate the token
+async function verifyViaSupabaseAPI(token) {
+  try {
+    const url = (SUPABASE_URL || '').replace(/\/$/, '') + '/auth/v1/user';
+    const r = await fetch(url, {
+      headers: {
+        'Authorization': 'Bearer ' + token,
+        'apikey': process.env.SUPABASE_ANON_KEY || '',
+      },
+    });
+    return r.ok;
+  } catch (e) {
+    return false;
+  }
 }
 
 function safeCompare(a, b) {
-  if (a.length !== b.length) {
-    crypto.timingSafeEqual(Buffer.from(a.padEnd(b.length)), Buffer.from(b.padEnd(a.length)));
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  if (a.length !== b.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+  } catch {
     return false;
   }
-  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 }
